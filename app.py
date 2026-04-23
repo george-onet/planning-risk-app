@@ -228,7 +228,7 @@ with st.sidebar:
     low_coverage_days = st.number_input("Low coverage days", min_value=1.0, value=14.0)
     poor_otif = st.number_input("Poor OTIF threshold", min_value=0.0, max_value=1.0, value=0.85, step=0.01)
 
-st.subheader("1) Upload data")
+st.subheader("Upload data")
 uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
 
 template_df = build_template()
