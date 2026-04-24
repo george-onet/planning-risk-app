@@ -47,8 +47,6 @@ if os.path.exists("usage_log.csv"):
 else:
     st.write("No usage yet")
 
-st.write("Files in environment:", os.listdir())
-
 st.markdown(
     """
     <style>
