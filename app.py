@@ -4,6 +4,23 @@ import streamlit as st
 from dataclasses import dataclass
 from typing import List
 
+from datetime import datetime
+import os
+
+LOG_FILE = "usage_log.csv"
+
+def log_event(event_name):
+    new_event = pd.DataFrame([{
+        "timestamp": datetime.now(),
+        "event": event_name
+    }])
+
+    if os.path.exists(LOG_FILE):
+        new_event.to_csv(LOG_FILE, mode="a", header=False, index=False)
+    else:
+        new_event.to_csv(LOG_FILE, index=False)
+
+log_event("TEST RUN")
 st.set_page_config(page_title="Planning Risk Prioritiser", layout="wide")
 st.markdown("""
 <style>
@@ -17,6 +34,11 @@ box-shadow: 0 4px 12px rgba(0,0,0,0.06);
 }
 </style>
 """, unsafe_allow_html=True)
+
+if "visited" not in st.session_state:
+    log_event("app_opened")
+    st.session_state["visited"]=True
+
 st.markdown(
     """
     <style>
