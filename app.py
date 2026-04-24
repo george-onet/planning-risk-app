@@ -20,7 +20,6 @@ def log_event(event_name):
     else:
         new_event.to_csv(LOG_FILE, index=False)
 
-log_event("TEST RUN")
 st.set_page_config(page_title="Planning Risk Prioritiser", layout="wide")
 st.markdown("""
 <style>
@@ -39,13 +38,6 @@ if "visited" not in st.session_state:
     log_event("app_opened")
     st.session_state["visited"]=True
 
-import time
-time.sleep(0.2)
-if os.path.exists("usage_log.csv"):
-    usage=pd.read_csv("usage_log.csv")
-    st.dataframe(usage)
-else:
-    st.write("No usage yet")
 
 st.markdown(
     """
