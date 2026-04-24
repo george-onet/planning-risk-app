@@ -39,6 +39,9 @@ if "visited" not in st.session_state:
     log_event("app_opened")
     st.session_state["visited"]=True
 
+import os
+st.write("Files in environment:", os.listdir())
+
 st.markdown(
     """
     <style>
