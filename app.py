@@ -310,11 +310,11 @@ def style_actions(val):
 
 def style_risk(val):
     if val >= high:
-        return "background-color: #f8d7da"
+        return "background-color: #f8d7da; color: #111111; font-weight: normal;"
     elif val >= mid:
-        return "background-color: #fff3cd"
+        return "background-color: #fff3cd; color: #111111; font-weight: normal;"
     else:
-        return ""
+        return "font-weight: normal;"
  
 
 
