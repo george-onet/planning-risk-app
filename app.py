@@ -8,48 +8,137 @@ from typing import List
 from datetime import datetime
 import os
 
+def normalize_sku(series):
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace("-", "", regex=False)
+        .str.replace("_", "", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+
+def clean_number(series):
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.replace("%", "", regex=False)
+        .str.replace("€", "", regex=False)
+        .str.replace("days", "", regex=False)
+        .str.replace("DAYS", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+
+def standardize_columns(df):
+    df.columns = (
+    df.columns.astype(str)
+    .str.strip()
+    .str.upper()
+    .str.replace(r"\s+", " ", regex=True)
+)
+
+    column_map = {
+        # ----------------
+        # SKU identifiers
+        # ----------------
+        "SKU": "sku",
+        "MATERIAL": "sku",
+        "ITEM": "sku",
+        "PRODUCT CODE": "sku",
+        "PRODUCT": "sku",
+        "ITEM CODE": "sku",
+        "MATERIAL NUMBER": "sku",
+        "PART NUMBER": "sku",
+
+        # ----------------
+        # Margin
+        # ----------------
+        "MARGIN": "margin",
+        "GROSS MARGIN": "margin",
+        "UNIT MARGIN": "margin",
+        "GM": "margin",
+        "PROFIT": "margin",
+        "CONTRIBUTION": "margin",
+
+        # ----------------
+        # Supplier OTIF
+        # ----------------
+        "SUPPLIER OTIF": "supplier_otif",
+        "OTIF": "supplier_otif",
+        "VENDOR OTIF": "supplier_otif",
+        "SUPPLIER SERVICE LEVEL": "supplier_otif",
+        "SERVICE LEVEL": "supplier_otif",
+
+        # ----------------
+        # Inventory
+        # ----------------
+        "INVENTORY ON HAND": "inventory_on_hand",
+        "ON HAND": "inventory_on_hand",
+        "STOCK": "inventory_on_hand",
+        "CURRENT STOCK": "inventory_on_hand",
+        "AVAILABLE STOCK": "inventory_on_hand",
+
+        "SAFETY STOCK": "safety_stock",
+        "BUFFER STOCK": "safety_stock",
+        "MIN STOCK": "safety_stock",
+
+        # ----------------
+        # Lead time
+        # ----------------
+        "LEAD TIME DAYS": "lead_time_days",
+        "LEAD TIME": "lead_time_days",
+        "LT": "lead_time_days",
+        "REPLENISHMENT DAYS": "lead_time_days",
+        "TRANSIT DAYS": "lead_time_days"
+    }
+
+    df = df.rename(columns=lambda x: column_map.get(x, x.lower()))
+    return df
+
 LOG_FILE = "usage_log.csv"
 def explain_sku_risk(row):
-    bias = row["actual"] -row["forecast"]
     drivers = []
 
-    # Demand impact
-    if row["abs_error"] >= 100:
-        score = row["abs_error"]  # higher error = higher impact
+    bias = row["actual"] - row["forecast"]
+    inventory = row["inventory_on_hand"]
+    safety = row["safety_stock"]
+    coverage = row["coverage_days"]
+    lead = row["lead_time_days"]
+    otif = row["supplier_otif"]
+    margin = row["margin"]
 
-        if bias > 0:
-            drivers.append(("Under-forecasting / stockout risk", score))
-        elif bias < 0:
-            drivers.append(("Over-forecasting / excess inventory risk", score))
+    # Physical inventory risk first
+    if inventory < safety:
+        drivers.append(("Inventory below safety stock", 1000))
 
-    # Inventory impact
-    if row["coverage_days"] < 10:
-        score = 10 - row["coverage_days"]  # lower coverage = worse
-        drivers.append(("Low inventory coverage", score))
+    if coverage < 3:
+        drivers.append(("Critical stock coverage", 900))
+    elif coverage < 14:
+        drivers.append(("Low stock coverage", 700))
 
-    # Supply impact
-    if row["lead_time_days"] >= 21:
-        score = row["lead_time_days"]  # longer = worse
-        drivers.append(("Long replenishment lead time", score))
+    # Supplier / replenishment risk
+    if otif < 0.80:
+        drivers.append(("Supplier reliability risk", 800))
 
-    if row["supplier_otif"] < 0.9:
-        score = (1 - row["supplier_otif"]) * 100  # lower OTIF = worse
-        drivers.append(("Supplier reliability risk", score))
+    if lead > 30:
+        drivers.append(("Long replenishment lead time", 600))
 
-    # Business impact
-    if row["margin"] >= 5:
-        score = row["margin"]
-        drivers.append(("High margin exposure", score))
+    # Forecast bias risk
+    if bias > 0 and inventory < safety:
+        drivers.append(("Under-forecasting / stockout risk", abs(bias)))
+    elif bias < 0 and inventory > safety * 1.5:
+        drivers.append(("Over-forecasting / excess inventory risk", abs(bias)))
 
-    # If nothing triggered
+    # Business exposure
+    if margin >= 10:
+        drivers.append(("High margin exposure", 500))
+
     if not drivers:
         return ["Risk appears controlled"]
 
-    # 🔥 NEW: sort by impact (highest first)
     drivers_sorted = sorted(drivers, key=lambda x: x[1], reverse=True)
 
-    # Return only labels (ordered)
-    return [d[0] for d in drivers_sorted[:2]]
+    return [d[0] for d in drivers_sorted[:3]]
 def log_event(event_name):
     new_event = pd.DataFrame([{
         "timestamp": datetime.now(),
@@ -266,12 +355,29 @@ def assign_action(df: pd.DataFrame, thresholds: RiskThresholds) -> pd.DataFrame:
     high_risk_cutoff = work["business_risk"].quantile(thresholds.high_risk_quantile)
 
     conditions = [
-        (work["business_risk"] >= high_risk_cutoff) & (work["coverage_days"] <= thresholds.low_coverage_days),
-        (work["inventory_on_hand"] > work["safety_stock"] * 2)
-        & (work["bias_pct"] <= thresholds.falling_demand_bias_pct),
-        (work["supplier_otif"] < thresholds.poor_otif) | (work["lead_time_days"] > work["lead_time_days"].median()),
-    ]
-    actions = ["EXPEDITE", "REDUCE INVENTORY", "SUPPLY ISSUE"]
+    # Critical supply / stockout risk
+    (work["coverage_days"] <= 3)
+    | (work["inventory_on_hand"] < work["safety_stock"]),
+
+    # Excess inventory / commercial exposure
+    (work["coverage_days"] > 60)
+    & (work["inventory_on_hand"] > work["safety_stock"] * 2),
+
+    # High business risk with too much cover
+    (work["business_risk"] >= 10000)
+    & (work["coverage_days"] > 45),
+
+    # Supplier issue
+    (work["supplier_otif"] < thresholds.poor_otif)
+    | (work["lead_time_days"] > work["lead_time_days"].median()),
+]
+
+    actions = [
+        "SUPPLY ISSUE",
+        "REDUCE INVENTORY",
+        "REDUCE INVENTORY",
+        "SUPPLY ISSUE",
+]
     work["recommended_action"] = np.select(conditions, actions, default="MONITOR")
 
     work["risk_drivers"] = (
@@ -326,7 +432,6 @@ st.markdown(
 
 with st.sidebar:
     st.header("Risk Model")
-    st.caption("Configure risk model behaviour.")
     demand_weight = st.slider("Demand risk", 0.0, 1.0, 0.5, 0.05)
     supply_weight = st.slider("Supply risk", 0.0, 1.0, 0.3, 0.05)
     inventory_weight = st.slider("Inventory risk", 0.0, 1.0, 0.2, 0.05)
@@ -397,6 +502,7 @@ st.download_button(
 if "uploaded_file" not in st.session_state or st.session_state["uploaded_file"] is None:
     st.info("No core SKU file uploaded. Showing sample data. Upload your core file to run your scenario.")
     df = template_df.copy()
+
 else:
     try:
         temp_df = pd.read_csv(
@@ -404,7 +510,13 @@ else:
             sep=None,
             engine="python"
         )
-        core_required = ["sku", "forecast", "actual", "volume"]
+        temp_df.columns = (
+            temp_df.columns.astype(str)
+            .str.strip()
+            .str.upper()
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        core_required = ["SKU", "FORECAST", "ACTUAL", "VOLUME"]
         missing_cols = [col for col in core_required if col not in temp_df.columns]
 
         if missing_cols:
@@ -414,77 +526,165 @@ else:
         else:
             df = temp_df.copy()
 
+
     except Exception:
         st.warning("Core SKU file could not be read. Showing sample data instead.")
-        df = template_df.copy()
+        df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace("_", " ", regex=False)
+        .str.replace("\ufeff", "", regex=False)
+    )
 
-margin_df = None
+    rename_map = {
+        "sku": "sku",
+        "SKU": "sku",
+        "product code": "sku",
+        "product_code": "sku",
+        "productcode": "sku",
+        "material": "sku",
+        "item": "sku",
+    }
 
-if margin_uploaded is not None:
-    margin_df = pd.read_csv(margin_uploaded, sep=None, engine="python")
+    df.rename(columns=rename_map, inplace=True)
+       
+if "sku" in df.columns:
+    df["sku"] = normalize_sku(df["sku"])
+    df.columns = df.columns.str.strip().str.lower()     
+else:
+    st.error("Core SKU file must contain a SKU column or product code column.")
+    df = template_df.copy()
 
-if margin_df is not None:
-    required_cols = ["sku", "margin"]
-
-    if not all(col in margin_df.columns for col in required_cols):
-        st.error("Margin file must contain columns: 'sku' and 'margin'")
-    else:
-        df = df.merge(
-            margin_df[["sku", "margin"]],
-            on="sku",
-            how="left",
-            suffixes=("", "_uploaded")
-        )
 margin_df = None
 
 if margin_uploaded is not None:
     try:
         margin_df = pd.read_csv(margin_uploaded, sep=None, engine="python")
-    except Exception:
-        st.warning("Could not read margin file. Skipping.")
+
+        margin_df.columns = (
+            margin_df.columns.astype(str)
+            .str. strip()
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+        )
+
+        rename_map = {
+            "product code": "sku",
+            "product_code": "sku",
+            "productcode": "sku",
+            "material": "sku",
+            "item": "sku",
+            "gross margin": "margin",
+            "gross_margin": "margin",
+            "margin %": "margin"
+        }
+
+        margin_df.columns = margin_df.columns.str.strip().str.replace('\ufeff', '', regex=False)
+        margin_df.rename(columns=rename_map, inplace=True)
+        
+
+        if "sku" in margin_df.columns:
+            margin_df["sku"] = normalize_sku(margin_df["sku"]) 
+        else:
+            st.error("No SKU column found in margin file after rename.")
+            margin_df = None
+
+    except Exception as e:
+        st.error(f"Margin file error: {e}")
         margin_df = None
 
 if margin_df is not None:
     required_cols = ["sku", "margin"]
-
+    
     if not all(col in margin_df.columns for col in required_cols):
         st.error("Margin file must contain columns: 'sku' and 'margin'")
     else:
-        df = df.merge(
-            margin_df[["sku", "margin"]],
-            on="sku",
-            how="left",
-            suffixes=("", "_uploaded")
+        margin_df["margin"] = pd.to_numeric(
+            clean_number(margin_df["margin"]),
+            errors="coerce"
         )
+        bad_margin = margin_df["margin"].isna().sum()
+        if bad_margin > 0:
+            st.warning(f"{bad_margin} margin row(s) could not be converted.")
+        duplicate_skus = margin_df[
+            margin_df["sku"].duplicated(keep=False)
+        ]["sku"].unique()
 
-        # ✅ Count BEFORE dropping
-        matched = 0
-        if "margin_uploaded" in df.columns:
-            matched = df["margin_uploaded"].notna().sum()
-
-        total = len(df)
-
-        # ✅ Apply uploaded values
-        if "margin_uploaded" in df.columns:
-            df["margin"] = df["margin_uploaded"].combine_first(df["margin"])
-            df = df.drop(columns=["margin_uploaded"])
-
-        # ✅ Split logic
-        if matched == 0:
-            if len(margin_df) > 0:
-                st.warning("Margin file uploaded, but no matching SKUs were found. Check SKU alignment.")
-            else:
-                st.error("Margin file appears empty or unreadable.")
+        if len(duplicate_skus) > 0:
+            st.error(
+                "Duplicate SKU(s) found. Examples: "
+                + ", ".join(duplicate_skus[:5])
+            )
         else:
-            st.success(f"Margin data merged for {matched:,}/{total:,} SKUs.")
+            df = df.merge(
+                margin_df[["sku", "margin"]],
+                on="sku",
+                how="left",
+                suffixes=("", "_uploaded")
+            )
 
-        st.caption("Preview of uploaded margin data")
-        st.dataframe(margin_df.head())
+            matched = 0
+            if "margin_uploaded" in df.columns:
+                matched = df["margin_uploaded"].notna().sum()
+
+            total = len(df)
+
+            if "margin_uploaded" in df.columns:
+                df["margin"] = df["margin_uploaded"].combine_first(df["margin"])
+                df = df.drop(columns=["margin_uploaded"])
+
+            if matched == 0:
+                if len(margin_df) > 0:
+                    st.warning("Margin file uploaded, but no matching SKUs were found. Check SKU alignment.")
+                else:
+                    st.error("Margin file appears empty or unreadable.")
+
+        
 
 supplier_df = None
 
 if supplier_uploaded is not None:
-    supplier_df = pd.read_csv(supplier_uploaded, sep=None, engine="python")
+    try:
+        supplier_df = pd.read_csv(supplier_uploaded, sep=None, engine="python")
+
+        supplier_df.columns = (
+            supplier_df.columns.astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+            .str.replace("\ufeff", "", regex=False)
+        )
+
+        rename_map = {
+            "product code": "sku",
+            "productcode": "sku",
+            "product_code": "sku",
+            "material": "sku",
+            "item": "sku",
+
+            "supplier": "supplier",
+            "vendor": "supplier",
+            "vendor name": "supplier",
+            "supplier name": "supplier",
+
+            "supplier otif": "supplier_otif",
+            "otif": "supplier_otif",
+            "vendor otif": "supplier_otif",
+            "otif %": "supplier_otif"
+        }
+
+        supplier_df.rename(columns=rename_map, inplace=True)
+
+        if "sku" in supplier_df.columns:
+            supplier_df["sku"] = normalize_sku(supplier_df["sku"])
+        else:
+            st.error("No SKU column found in supplier file.")
+            supplier_df = None
+
+    except Exception as e:
+        st.error(f"Supplier file error: {e}")
+        supplier_df = None
 
 if supplier_df is not None:
     required_cols = ["sku", "supplier_otif"]
@@ -492,6 +692,11 @@ if supplier_df is not None:
     if not all(col in supplier_df.columns for col in required_cols):
         st.error("Supplier file must contain columns: 'sku' and 'supplier_otif'")
     else:
+        supplier_df["supplier_otif"] = pd.to_numeric(
+            clean_number(supplier_df["supplier_otif"]),
+            errors="coerce"
+        )
+
         df = df.merge(
             supplier_df[["sku", "supplier_otif"]],
             on="sku",
@@ -499,113 +704,210 @@ if supplier_df is not None:
             suffixes=("", "_uploaded")
         )
 
-        # ✅ COUNT BEFORE modifying
+        matched = 0
         if "supplier_otif_uploaded" in df.columns:
             matched = df["supplier_otif_uploaded"].notna().sum()
-        else:
-            matched = 0
-
-        total = len(df)
-
-        if matched == 0:
-            if len (supplier_df) > 0:
-                st.warning("Supplier file uploaded, but no matching SKUs were found")
-            else:
-                st.error("Supplier file appears empty or unreadable")
-        else:
-            st.success(f"Supplier data merged for {matched:,}/{total:,} SKUs.")
-
-        # ✅ THEN combine
-        if "supplier_otif_uploaded" in df.columns:
             df["supplier_otif"] = df["supplier_otif_uploaded"].combine_first(df["supplier_otif"])
             df = df.drop(columns=["supplier_otif_uploaded"])
 
-        st.caption("Preview of uploaded supplier data")
-        st.dataframe(supplier_df.head())
+        total = len(df)
 
+# =========================
+# INVENTORY BLOCK
+# =========================
 inventory_df = None
 
 if inventory_uploaded is not None:
     inventory_df = pd.read_csv(inventory_uploaded, sep=None, engine="python")
 
+    inventory_df.columns = (
+        inventory_df.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace("_", " ", regex=False)
+        .str.replace("\ufeff", "", regex=False)
+    )
+
+    rename_map = {
+        "product code": "sku",
+        "productcode": "sku",
+        "product_code": "sku",
+        "material": "sku",
+        "item": "sku",
+        "stock on hand": "inventory_on_hand",
+        "inventory on hand": "inventory_on_hand",
+        "on hand": "inventory_on_hand",
+        "safety stock": "safety_stock",
+    }
+
+    inventory_df.rename(columns=rename_map, inplace=True)
+
+    if "sku" in inventory_df.columns:
+        inventory_df["sku"] = normalize_sku(inventory_df["sku"])
+    else:
+        st.error("No SKU column found in inventory file.")
+        inventory_df = None
+
 if inventory_df is not None:
+
     required_cols = ["sku", "inventory_on_hand", "safety_stock"]
 
     if not all(col in inventory_df.columns for col in required_cols):
-        st.error("Inventory file must contain columns: 'sku', 'inventory_on_hand', and 'safety_stock'")
-    else:
-        df = df.merge(
-            inventory_df[["sku", "inventory_on_hand", "safety_stock"]],
-            on="sku",
-            how="left",
-            suffixes=("", "_uploaded")
+        st.error(
+            "Inventory file must contain columns: "
+            "'sku', 'inventory_on_hand', and 'safety_stock'"
         )
 
-        # ✅ Calculate matches BEFORE dropping columns
-        matched = 0
-        if "inventory_on_hand_uploaded" in df.columns:
-            matched = df["inventory_on_hand_uploaded"].notna().sum()
+    else:
+        inventory_df["inventory_on_hand"] = pd.to_numeric(
+            clean_number(inventory_df["inventory_on_hand"]),
+            errors="coerce"
+        )
 
-        total = len(df)
+        inventory_df["safety_stock"] = pd.to_numeric(
+            clean_number(inventory_df["safety_stock"]),
+            errors="coerce"
+        )
 
-        # ✅ Apply uploaded values
-        for col in ["inventory_on_hand", "safety_stock"]:
-            uploaded_col = f"{col}_uploaded"
-            if uploaded_col in df.columns:
-                df[col] = df[uploaded_col].combine_first(df[col])
-                df = df.drop(columns=[uploaded_col])
+        bad_inventory = inventory_df[
+            ["inventory_on_hand", "safety_stock"]
+        ].isna().sum().sum()
 
-        # ✅ Messaging
-        if matched == 0:
-            if len (inventory_df) > 0:
-                st.warning("Inventory file uploaded, but no matching SKUs were found. Check SKU alignment.")
-            else:
-                st.error("Inventory file appears empty or unreadable.")
+        if bad_inventory > 0:
+            st.warning(
+                f"{bad_inventory} inventory value(s) could not be converted."
+            )
+
+        duplicate_skus = inventory_df[
+            inventory_df["sku"].duplicated(keep=False)
+        ]["sku"].unique()
+
+        if len(duplicate_skus) > 0:
+            st.error(
+                "Inventory file contains duplicate SKU(s). Examples: "
+                + ", ".join(duplicate_skus[:5])
+            )
+
         else:
-            st.success(f"Inventory data merged for {matched:,}/{total:,} SKUs.")
+            df = df.merge(
+                inventory_df[
+                    ["sku", "inventory_on_hand", "safety_stock"]
+                ],
+                on="sku",
+                how="left",
+                suffixes=("", "_uploaded")
+            )
 
-        st.caption("Preview of uploaded inventory data")
-        st.dataframe(inventory_df.head())
+            matched = 0
+
+            if "inventory_on_hand_uploaded" in df.columns:
+                matched = df["inventory_on_hand_uploaded"].notna().sum()
+
+            total = len(df)
+
+            for col in ["inventory_on_hand", "safety_stock"]:
+                uploaded_col = f"{col}_uploaded"
+
+                if uploaded_col in df.columns:
+                    df[col] = df[uploaded_col].combine_first(df[col])
+                    df = df.drop(columns=[uploaded_col])
+
+            if matched == 0:
+                if len(inventory_df) > 0:
+                    st.warning(
+                        "Inventory file uploaded, but no matching SKUs were found. "
+                        "Check SKU alignment."
+                    )
+                else:
+                    st.error(
+                        "Inventory file appears empty or unreadable."
+                    )
+
+            
 
 leadtime_df = None
 
 if leadtime_uploaded is not None:
-    leadtime_df = pd.read_csv(leadtime_uploaded, sep=None, engine="python")
+    leadtime_df = pd.read_csv(leadtime_uploaded, sep=None,engine="python")
+    leadtime_df = standardize_columns(leadtime_df)
+    leadtime_df.columns = (
+    leadtime_df.columns.astype(str)
+    .str.strip()
+    .str.lower()
+    .str.replace("_", " ", regex=False)
+    .str.replace("\ufeff", "", regex=False)
+)
+
+    rename_map = {
+    "product code": "sku",
+    "productcode": "sku",
+    "product_code": "sku",
+    "material": "sku",
+    "item": "sku",
+
+    "lead time": "lead_time_days",
+    "lead time days": "lead_time_days",
+    "lead_time": "lead_time_days",
+    "lead_time_days": "lead_time_days",
+    "replenishment lead time": "lead_time_days",
+    "lt": "lead_time_days"
+}
+
+    leadtime_df.rename(columns=rename_map, inplace=True)
 
 if leadtime_df is not None:
     required_cols = ["sku", "lead_time_days"]
 
     if not all(col in leadtime_df.columns for col in required_cols):
         st.error("Lead time file must contain columns: 'sku' and 'lead_time_days'")
+
     else:
-        df = df.merge(
-            leadtime_df[["sku", "lead_time_days"]],
-            on="sku",
-            how="left",
-            suffixes=("", "_uploaded")
+
+        leadtime_df["lead_time_days"] = pd.to_numeric(
+        clean_number(leadtime_df["lead_time_days"]),
+        errors="coerce"
         )
 
-        # Count uploaded matches BEFORE dropping the uploaded column
-        matched = 0
-        if "lead_time_days_uploaded" in df.columns:
-            matched = df["lead_time_days_uploaded"].notna().sum()
+        bad_leadtime = leadtime_df["lead_time_days"].isna().sum()
 
-        total = len(df)
+        if bad_leadtime > 0:
+            st.warning(f"{bad_leadtime} lead time value(s) could not be converted.")
+        duplicate_skus = leadtime_df[
+            leadtime_df["sku"].duplicated(keep=False)
+        ]["sku"].unique()
 
-        # Apply uploaded values
-        if "lead_time_days_uploaded" in df.columns:
-            df["lead_time_days"] = df["lead_time_days_uploaded"].combine_first(df["lead_time_days"])
-            df = df.drop(columns=["lead_time_days_uploaded"])
+        if len(duplicate_skus) > 0:
+            st.error(
+                "Lead time file contains duplicate SKU(s). Examples: "
+                + ", ".join(duplicate_skus[:5])
+            )
+            leadtime_df = None
 
-        # Messaging
-        if matched == 0:
-            if len(leadtime_df) > 0:
-                st.warning("Lead time file uploaded, but no matching SKUs were found. Check file content for SKU alignment.")
-            else:
-                st.success(f"Lead time data merged for {matched:,}/{total:,} SKUs.")
+        else:
+            df = df.merge(
+                leadtime_df[["sku", "lead_time_days"]],
+                on="sku",
+                how="left",
+                suffixes=("", "_uploaded")
+            )
 
-        st.caption("Preview of uploaded lead time data")
-        st.dataframe(leadtime_df.head())
+            matched = 0
+            if "lead_time_days_uploaded" in df.columns:
+                matched = df["lead_time_days_uploaded"].notna().sum()
+
+            total = len(df)
+
+            if "lead_time_days_uploaded" in df.columns:
+                df["lead_time_days"] = df["lead_time_days_uploaded"].combine_first(df["lead_time_days"])
+                df = df.drop(columns=["lead_time_days_uploaded"])
+
+            if matched == 0:
+                if len(leadtime_df) > 0:
+                    st.warning("Lead time file uploaded, but no matching SKUs were found. Check SKU alignment.")
+                else:
+                    st.error("Lead time file appears empty or unreadable.")
+
+            
 
 history_df = None
 
@@ -628,7 +930,6 @@ max_top_n = max(1, min(50, len(result_df)))
 default_top_n = min(10, max_top_n)
 if max_top_n == 1:
     top_n = 1
-    st.caption("Only 1 SKU available in the current filtered dataset.")
 elif max_top_n <= 5:
     top_n = st.slider("Priority SKUs to display", 1, max_top_n, default_top_n)
 else:
@@ -784,18 +1085,43 @@ selected = result_df[result_df["sku"] == selected_sku].iloc[0]
 mape = None
 sku_history = None
 
-if history_df is not None and {"sku", "actual", "forecast"}.issubset(history_df.columns):
-    sku_history = history_df[history_df["sku"] == selected_sku]
+if history_df is not None:
 
-    if not sku_history.empty:
-        sku_history["ape"] = sku_history.apply(
-            lambda r: abs(r["actual"] - r["forecast"]) / r["actual"] if r["actual"] != 0 else 0,
-            axis=1
-        )
-        mape = sku_history["ape"].mean()
+    history_df.columns = (
+        history_df.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace("_", " ", regex=False)
+    )
 
-elif history_df is not None:
-    st.warning("Invalid forecast history file. Required columns: sku, actual, forecast.")
+    history_df = history_df.rename(columns={
+        "sku": "sku",
+        "product code": "sku",
+        "actual": "actual",
+        "forecast": "forecast",
+        "date": "date",
+        "month": "date"
+    })
+
+    if {"sku", "actual", "forecast"}.issubset(history_df.columns):
+
+        history_df["sku"] = normalize_sku(history_df["sku"])
+        history_df["actual"] = pd.to_numeric(clean_number(history_df["actual"]), errors="coerce")
+        history_df["forecast"] = pd.to_numeric(clean_number(history_df["forecast"]), errors="coerce")
+
+        sku_history = history_df[history_df["sku"] == selected_sku].copy()
+
+        if not sku_history.empty:
+            sku_history["ape"] = np.where(
+                sku_history["actual"] != 0,
+                abs(sku_history["actual"] - sku_history["forecast"]) / sku_history["actual"],
+                np.nan
+            )
+
+            mape = sku_history["ape"].mean()
+
+    else:
+        st.warning("Invalid forecast history file. Required columns: sku, actual, forecast.")
 
 else:
     sku_history = None
@@ -815,16 +1141,41 @@ else:
 
 # --- FORECAST VS ACTUAL CHART ---
 if sku_history is not None and not sku_history.empty:
-    sku_history = sku_history.sort_values("date")
+    sku_history = sku_history.copy()
 
-    st.markdown("#### Forecast vs Actual")
-
-    sku_history["error"] = sku_history["actual"] - sku_history["forecast"]
-
-    st.line_chart(
-        sku_history.set_index("date")[["forecast", "actual", "error"]]
+    sku_history.columns = (
+        sku_history.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace("_", " ", regex=False)
     )
 
+    sku_history = sku_history.rename(columns={
+        "forecast": "forecast",
+        "actual": "actual",
+        "date": "date",
+        "month": "date"
+    })
+
+    required_history_cols = ["date", "forecast", "actual"]
+
+    if all(col in sku_history.columns for col in required_history_cols):
+        sku_history["forecast"] = pd.to_numeric(clean_number(sku_history["forecast"]), errors="coerce")
+        sku_history["actual"] = pd.to_numeric(clean_number(sku_history["actual"]), errors="coerce")
+        sku_history["date"] = pd.to_datetime(sku_history["date"], errors="coerce")
+
+        sku_history = sku_history.dropna(subset=["date", "forecast", "actual"])
+        sku_history = sku_history.sort_values("date")
+
+        st.markdown("### Forecast vs Actual")
+
+        sku_history["error"] = sku_history["actual"] - sku_history["forecast"]
+
+        st.line_chart(
+            sku_history.set_index("date")[["forecast", "actual", "error"]]
+        )
+    else:
+        st.warning("Forecast history file must contain date, forecast, and actual columns.")
 else:
     st.warning("No historical data available for this SKU")
 
@@ -834,23 +1185,42 @@ reasons = explain_sku_risk(selected)
 st.markdown("### Risk drivers")
 
 action = selected.get("recommended_action", "").upper()
-
 clean_reasons = " • ".join(reasons)
 
-if action == "MONITOR":
-    st.success("✔ No risk detected")
-
-elif action == "EXPEDITE":
+if selected["coverage_days"] <= 3:
     st.error(f"🚨 {clean_reasons}")
 
-elif action == "SUPPLY ISSUE":
-    st.warning(f"⚠ {clean_reasons}")
+elif selected["inventory_on_hand"] < selected["safety_stock"]:
+    st.error(f"🚨 {clean_reasons}")
+
+elif selected["supplier_otif"] < 0.80:
+    st.error(f"🚨 {clean_reasons}")
+
+# High € exposure but not urgent operationally
+elif selected["business_risk"] >= 10000 and action == "MONITOR":
+    st.warning(f"⚠️ {clean_reasons}")
+
+# Reduce inventory / excess stock
+elif action == "REDUCE INVENTORY" and selected["business_risk"] >= 10000:
+    st.warning(f"⚠️ {clean_reasons}")
 
 elif action == "REDUCE INVENTORY":
     st.info(f"📦 {clean_reasons}")
 
+# Medium operational risk
+elif (
+    selected["coverage_days"] <= 14
+    or selected["supplier_otif"] < 0.90
+    or selected["lead_time_days"] > 30
+):
+    st.warning(f"⚠️ {clean_reasons}")
+
+# Low risk monitor
+elif action == "MONITOR":
+    st.success(f"✅ {clean_reasons}")
+
 else:
-    st.warning(f"⚠ {clean_reasons}")
+    st.success(f"✅ {clean_reasons}")
 
 explain_df = pd.DataFrame(
     {
