@@ -37,6 +37,143 @@ def standardize_columns(df):
     .str.replace(r"\s+", " ", regex=True)
 )
 
+def read_file(uploaded_file):
+    if uploaded_file.name.lower().endswith(".xlsx"):
+        return pd.read_excel(uploaded_file)
+    return pd.read_csv(uploaded_file, sep=None, engine="python")
+
+
+def clean_headers(df):
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_", regex=False)
+        .str.replace("-", "_", regex=False)
+        .str.replace("\ufeff", "", regex=False)
+    )
+    return df
+
+
+def normalize_bool(series):
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.upper()
+        .replace({
+            "YES": True,
+            "Y": True,
+            "TRUE": True,
+            "1": True,
+            "NO": False,
+            "N": False,
+            "FALSE": False,
+            "0": False
+        })
+    )
+
+
+def upload_and_merge(
+    uploaded_file,
+    file_label,
+    required_cols,
+    rename_map,
+    numeric_cols,
+    merge_cols,
+    df
+):
+    if uploaded_file is None:
+        return df, None
+
+    try:
+        upload_df = read_file(uploaded_file)
+        upload_df = clean_headers(upload_df)
+        upload_df.rename(columns=rename_map, inplace=True)
+
+        missing = [c for c in required_cols if c not in upload_df.columns]
+
+        if missing:
+            st.error(
+                f"✕ {file_label} failed. Missing columns: "
+                + ", ".join(missing).upper()
+            )
+            return df, None
+
+        if "sku" in df.columns:
+            df["sku"] = normalize_sku(df["sku"])
+
+        if "sku" in upload_df.columns:
+            upload_df["sku"] = normalize_sku(upload_df["sku"])
+
+        for col in numeric_cols:
+            if col in upload_df.columns:
+                upload_df[col] = pd.to_numeric(
+                    clean_number(upload_df[col]),
+                    errors="coerce"
+                )
+
+        duplicate_skus = upload_df[
+            upload_df["sku"].duplicated(keep=False)
+        ]["sku"].unique()
+
+        if len(duplicate_skus) > 0:
+            st.error(
+                f"✕ {file_label} failed. Duplicate SKU(s): "
+                + ", ".join(duplicate_skus[:5])
+            )
+            return df, None
+
+        available_merge_cols = [c for c in merge_cols if c in upload_df.columns]
+
+        if "sku" not in available_merge_cols:
+            st.error(f"✕ {file_label} failed. Missing SKU column.")
+            return df, None
+
+        upload_df = upload_df[available_merge_cols].copy()
+
+        rename_uploaded_cols = {
+            col: f"{col}_new"
+            for col in available_merge_cols
+            if col != "sku"
+        }
+
+        upload_df = upload_df.rename(columns=rename_uploaded_cols)
+
+        df = df.merge(
+            upload_df,
+            on="sku",
+            how="left"
+        )
+
+        matched = 0
+
+        for col in available_merge_cols:
+            if col == "sku":
+                continue
+
+            new_col = f"{col}_new"
+
+            if new_col in df.columns:
+                matched += df[new_col].notna().sum()
+
+                if col in df.columns:
+                    df[col] = df[new_col].combine_first(df[col])
+                else:
+                    df[col] = df[new_col]
+
+                df = df.drop(columns=[new_col])
+
+        if matched == 0:
+            st.warning(f"! {file_label} loaded, but no matching SKUs found.")
+        else:
+            st.success(f"✓ {file_label} loaded")
+
+        return df, upload_df
+
+    except Exception as e:
+        st.error(f"✕ {file_label} failed to load.")
+        return df, None
+
     column_map = {
         # ----------------
         # SKU identifiers
@@ -259,12 +396,29 @@ def format_action(action: str) -> str:
     return f"{ACTION_ICON.get(action, '⚪')} {action}"
 
 
-def compute_metrics(df: pd.DataFrame, demand_weight: float, supply_weight: float, inventory_weight: float):
+def compute_metrics(
+    df: pd.DataFrame,
+    demand_weight: float,
+    supply_weight: float,
+    inventory_weight: float,
+    demand_change_pct: float = 0,
+    lead_time_change_days: float = 0,
+    otif_change_pct: float = 0,
+):
     work = df.copy()
-
     numeric_cols = [c for c in REQUIRED_COLUMNS if c != "sku"] + [c for c in OPTIONAL_HISTORY_COLUMNS if c in work.columns]
     for col in numeric_cols:
         work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    # --- Scenario Pack Adjustments ---
+    work["forecast"] = work["forecast"] * (1 + demand_change_pct / 100)
+
+    work["lead_time_days"] = work["lead_time_days"] + lead_time_change_days
+
+    work["supplier_otif"] = work["supplier_otif"] * (1 + otif_change_pct / 100)
+
+    # Keep OTIF valid
+    work["supplier_otif"] = work["supplier_otif"].clip(0, 1)
 
     work["bias"] = work["actual"] - work["forecast"]
     work["abs_error"] = (work["actual"] - work["forecast"]).abs()
@@ -350,8 +504,23 @@ def compute_metrics(df: pd.DataFrame, demand_weight: float, supply_weight: float
     return work
 
 
-def assign_action(df: pd.DataFrame, thresholds: RiskThresholds) -> pd.DataFrame:
+def assign_action(
+    df: pd.DataFrame,
+    thresholds: RiskThresholds,
+    contract_active: bool = False,
+    moq_waived: bool = False,
+) -> pd.DataFrame:
+
     work = df.copy()
+    
+    for col, default in {
+    "call_off_volume": 0,
+    "moq": 0,
+    "supplier_locked": False,
+    "strategic_customer": False,
+}.items():
+        if col not in work.columns:
+            work[col] = default
     high_risk_cutoff = work["business_risk"].quantile(thresholds.high_risk_quantile)
 
     conditions = [
@@ -359,6 +528,13 @@ def assign_action(df: pd.DataFrame, thresholds: RiskThresholds) -> pd.DataFrame:
     (work["coverage_days"] <= 3)
     | (work["inventory_on_hand"] < work["safety_stock"]),
 
+ # Contract constraint review
+(
+    (contract_active == True)
+    & (moq_waived == False)
+    & (work["call_off_volume"] > 0)
+    & (work["coverage_days"] > 60)
+),
     # Excess inventory / commercial exposure
     (work["coverage_days"] > 60)
     & (work["inventory_on_hand"] > work["safety_stock"] * 2),
@@ -374,6 +550,7 @@ def assign_action(df: pd.DataFrame, thresholds: RiskThresholds) -> pd.DataFrame:
 
     actions = [
         "SUPPLY ISSUE",
+        "REVIEW CONTRACT",
         "REDUCE INVENTORY",
         "REDUCE INVENTORY",
         "SUPPLY ISSUE",
@@ -442,489 +619,391 @@ with st.sidebar:
         demand_weight /= total
         supply_weight /= total
         inventory_weight /= total
+    st.header("Scenario Pack")
+
+    demand_change_pct = st.slider(
+        "Demand change (%)",
+        min_value=-30,
+        max_value=30,
+        value=0,
+        step=5
+    )
+
+    lead_time_change_days = st.slider(
+        "Lead time change (days)",
+        min_value=-10,
+        max_value=30,
+        value=0,
+        step=1
+    )
+
+    otif_change_pct = st.slider(
+        "Supplier OTIF change (%)",
+        min_value=-30,
+        max_value=10,
+        value=0,
+        step=5
+    )
+
+    contract_active = st.checkbox(
+        "Contract constraints active",
+        value=False
+    )
+
+    moq_waived = st.checkbox(
+        "MOQ waived",
+        value=False
+    )
+
 
     st.header("Thresholds")
     low_coverage_days = st.number_input("Low coverage days", min_value=1.0, value=14.0)
     poor_otif = st.number_input("Poor OTIF threshold", min_value=0.0, max_value=1.0, value=0.85, step=0.01)
 
-st.subheader("Upload data")
-uploaded = st.file_uploader(
-    "Current SKU planning data (required)",
-    type=["csv"],
-    key="main_upload"
-)
+# ==========================================================
+# UNIVERSAL UPLOAD ENGINE (OPTION B)
+# Replace all 7 current upload blocks with this section
+# ==========================================================
 
-history_uploaded = st.file_uploader(
-    "Forecast vs actual history (optional)",
-    type=["csv"],
-    key="history_upload"
-)
-
-if uploaded is not None:
-    st.session_state["uploaded_file"] = uploaded
-
-if history_uploaded is not None:
-    st.session_state["history_file"] = history_uploaded
-
-margin_uploaded = st.file_uploader(
-    "Upload margin data (optional)",
-    type=["csv"],
-    key="margin_upload"
-)
-
-supplier_uploaded = st.file_uploader(
-    "Upload supplier data (optional)",
-    type=["csv"],
-    key="supplier_upload"
-)
-
-inventory_uploaded = st.file_uploader(
-    "Upload inventory data (optional)",
-    type=["csv"],
-    key="inventory_upload"
-)
-
-leadtime_uploaded = st.file_uploader(
-    "Upload lead time data (optional)",
-    type=["csv"],
-    key="leadtime upload"
-)
-
-template_df = build_template()
-template_csv = template_df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Download CSV template",
-    data=template_csv,
-    file_name="planning_risk_template.csv",
-    mime="text/csv",
-)
-
-if "uploaded_file" not in st.session_state or st.session_state["uploaded_file"] is None:
-    st.info("No core SKU file uploaded. Showing sample data. Upload your core file to run your scenario.")
-    df = template_df.copy()
-
-else:
-    try:
-        temp_df = pd.read_csv(
-            st.session_state["uploaded_file"],
-            sep=None,
-            engine="python"
-        )
-        temp_df.columns = (
-            temp_df.columns.astype(str)
-            .str.strip()
-            .str.upper()
-            .str.replace(r"\s+", " ", regex=True)
-        )
-        core_required = ["SKU", "FORECAST", "ACTUAL", "VOLUME"]
-        missing_cols = [col for col in core_required if col not in temp_df.columns]
-
-        if missing_cols:
-            st.error("Core SKU file missing required columns: " + ", ".join(missing_cols) + ". Showing sample data instead."
-            )
-            df = template_df.copy()
-        else:
-            df = temp_df.copy()
+def read_file(uploaded_file):
+    if uploaded_file.name.lower().endswith(".xlsx"):
+        return pd.read_excel(uploaded_file)
+    return pd.read_csv(uploaded_file, sep=None, engine="python")
 
 
-    except Exception:
-        st.warning("Core SKU file could not be read. Showing sample data instead.")
-        df.columns = (
-        df.columns.astype(str)
+def clean_headers(upload_df):
+    upload_df.columns = (
+        upload_df.columns.astype(str)
         .str.strip()
         .str.lower()
-        .str.replace("_", " ", regex=False)
+        .str.replace(" ", "_", regex=False)
         .str.replace("\ufeff", "", regex=False)
     )
+    return upload_df
 
-    rename_map = {
-        "sku": "sku",
-        "SKU": "sku",
-        "product code": "sku",
-        "product_code": "sku",
-        "productcode": "sku",
-        "material": "sku",
-        "item": "sku",
-    }
+    upload_df = None
 
-    df.rename(columns=rename_map, inplace=True)
-       
-if "sku" in df.columns:
-    df["sku"] = normalize_sku(df["sku"])
-    df.columns = df.columns.str.strip().str.lower()     
-else:
-    st.error("Core SKU file must contain a SKU column or product code column.")
-    df = template_df.copy()
+    if uploaded_file is not None:
+        try:
+            upload_df = read_file(uploaded_file)
+            upload_df = clean_headers(upload_df)
+            upload_df.rename(columns=rename_map, inplace=True)
 
-margin_df = None
+            missing = [c for c in required_cols if c not in upload_df.columns]
 
-if margin_uploaded is not None:
-    try:
-        margin_df = pd.read_csv(margin_uploaded, sep=None, engine="python")
+            if missing:
+                st.error(
+                    f"✗ {label} failed. Missing columns: "
+                    + ", ".join(missing).upper()
+                )
+                return df, None
 
-        margin_df.columns = (
-            margin_df.columns.astype(str)
-            .str. strip()
-            .str.lower()
-            .str.replace("_", " ", regex=False)
-        )
+            upload_df["sku"] = normalize_sku(upload_df["sku"])
 
-        rename_map = {
-            "product code": "sku",
-            "product_code": "sku",
-            "productcode": "sku",
-            "material": "sku",
-            "item": "sku",
-            "gross margin": "margin",
-            "gross_margin": "margin",
-            "margin %": "margin"
-        }
+            for col in numeric_cols:
+                if col in upload_df.columns:
+                    upload_df[col] = pd.to_numeric(
+                        clean_number(upload_df[col]),
+                        errors="coerce"
+                    )
 
-        margin_df.columns = margin_df.columns.str.strip().str.replace('\ufeff', '', regex=False)
-        margin_df.rename(columns=rename_map, inplace=True)
-        
+            duplicate_skus = upload_df[
+                upload_df["sku"].duplicated(keep=False)
+            ]["sku"].unique()
 
-        if "sku" in margin_df.columns:
-            margin_df["sku"] = normalize_sku(margin_df["sku"]) 
-        else:
-            st.error("No SKU column found in margin file after rename.")
-            margin_df = None
+            if len(duplicate_skus) > 0:
+                st.error(
+                    f"✗ {label} failed. Duplicate SKU(s): "
+                    + ", ".join(duplicate_skus[:5])
+                )
+                return df, None
 
-    except Exception as e:
-        st.error(f"Margin file error: {e}")
-        margin_df = None
+            st.success(f"✓ {label} loaded")
 
-if margin_df is not None:
-    required_cols = ["sku", "margin"]
-    
-    if not all(col in margin_df.columns for col in required_cols):
-        st.error("Margin file must contain columns: 'sku' and 'margin'")
-    else:
-        margin_df["margin"] = pd.to_numeric(
-            clean_number(margin_df["margin"]),
-            errors="coerce"
-        )
-        bad_margin = margin_df["margin"].isna().sum()
-        if bad_margin > 0:
-            st.warning(f"{bad_margin} margin row(s) could not be converted.")
-        duplicate_skus = margin_df[
-            margin_df["sku"].duplicated(keep=False)
-        ]["sku"].unique()
+        except Exception:
+            st.error(f"✗ {label} failed")
+            return df, None
 
-        if len(duplicate_skus) > 0:
-            st.error(
-                "Duplicate SKU(s) found. Examples: "
-                + ", ".join(duplicate_skus[:5])
-            )
-        else:
-            df = df.merge(
-                margin_df[["sku", "margin"]],
-                on="sku",
-                how="left",
-                suffixes=("", "_uploaded")
-            )
-
-            matched = 0
-            if "margin_uploaded" in df.columns:
-                matched = df["margin_uploaded"].notna().sum()
-
-            total = len(df)
-
-            if "margin_uploaded" in df.columns:
-                df["margin"] = df["margin_uploaded"].combine_first(df["margin"])
-                df = df.drop(columns=["margin_uploaded"])
-
-            if matched == 0:
-                if len(margin_df) > 0:
-                    st.warning("Margin file uploaded, but no matching SKUs were found. Check SKU alignment.")
-                else:
-                    st.error("Margin file appears empty or unreadable.")
-
-        
-
-supplier_df = None
-
-if supplier_uploaded is not None:
-    try:
-        supplier_df = pd.read_csv(supplier_uploaded, sep=None, engine="python")
-
-        supplier_df.columns = (
-            supplier_df.columns.astype(str)
-            .str.strip()
-            .str.lower()
-            .str.replace("_", " ", regex=False)
-            .str.replace("\ufeff", "", regex=False)
-        )
-
-        rename_map = {
-            "product code": "sku",
-            "productcode": "sku",
-            "product_code": "sku",
-            "material": "sku",
-            "item": "sku",
-
-            "supplier": "supplier",
-            "vendor": "supplier",
-            "vendor name": "supplier",
-            "supplier name": "supplier",
-
-            "supplier otif": "supplier_otif",
-            "otif": "supplier_otif",
-            "vendor otif": "supplier_otif",
-            "otif %": "supplier_otif"
-        }
-
-        supplier_df.rename(columns=rename_map, inplace=True)
-
-        if "sku" in supplier_df.columns:
-            supplier_df["sku"] = normalize_sku(supplier_df["sku"])
-        else:
-            st.error("No SKU column found in supplier file.")
-            supplier_df = None
-
-    except Exception as e:
-        st.error(f"Supplier file error: {e}")
-        supplier_df = None
-
-if supplier_df is not None:
-    required_cols = ["sku", "supplier_otif"]
-
-    if not all(col in supplier_df.columns for col in required_cols):
-        st.error("Supplier file must contain columns: 'sku' and 'supplier_otif'")
-    else:
-        supplier_df["supplier_otif"] = pd.to_numeric(
-            clean_number(supplier_df["supplier_otif"]),
-            errors="coerce"
-        )
+    if upload_df is not None:
 
         df = df.merge(
-            supplier_df[["sku", "supplier_otif"]],
+            upload_df[merge_cols],
             on="sku",
             how="left",
             suffixes=("", "_uploaded")
         )
 
         matched = 0
-        if "supplier_otif_uploaded" in df.columns:
-            matched = df["supplier_otif_uploaded"].notna().sum()
-            df["supplier_otif"] = df["supplier_otif_uploaded"].combine_first(df["supplier_otif"])
-            df = df.drop(columns=["supplier_otif_uploaded"])
 
-        total = len(df)
+        for col in merge_cols:
+            if col == "sku":
+                continue
 
-# =========================
-# INVENTORY BLOCK
-# =========================
-inventory_df = None
+            uploaded_col = f"{col}_uploaded"
 
-if inventory_uploaded is not None:
-    inventory_df = pd.read_csv(inventory_uploaded, sep=None, engine="python")
+            if uploaded_col in df.columns:
+                matched = max(matched, df[uploaded_col].notna().sum())
+                df[col] = df[uploaded_col].combine_first(df[col])
+                df = df.drop(columns=[uploaded_col])
 
-    inventory_df.columns = (
-        inventory_df.columns.astype(str)
-        .str.strip()
-        .str.lower()
-        .str.replace("_", " ", regex=False)
-        .str.replace("\ufeff", "", regex=False)
-    )
-
-    rename_map = {
-        "product code": "sku",
-        "productcode": "sku",
-        "product_code": "sku",
-        "material": "sku",
-        "item": "sku",
-        "stock on hand": "inventory_on_hand",
-        "inventory on hand": "inventory_on_hand",
-        "on hand": "inventory_on_hand",
-        "safety stock": "safety_stock",
-    }
-
-    inventory_df.rename(columns=rename_map, inplace=True)
-
-    if "sku" in inventory_df.columns:
-        inventory_df["sku"] = normalize_sku(inventory_df["sku"])
-    else:
-        st.error("No SKU column found in inventory file.")
-        inventory_df = None
-
-if inventory_df is not None:
-
-    required_cols = ["sku", "inventory_on_hand", "safety_stock"]
-
-    if not all(col in inventory_df.columns for col in required_cols):
-        st.error(
-            "Inventory file must contain columns: "
-            "'sku', 'inventory_on_hand', and 'safety_stock'"
-        )
-
-    else:
-        inventory_df["inventory_on_hand"] = pd.to_numeric(
-            clean_number(inventory_df["inventory_on_hand"]),
-            errors="coerce"
-        )
-
-        inventory_df["safety_stock"] = pd.to_numeric(
-            clean_number(inventory_df["safety_stock"]),
-            errors="coerce"
-        )
-
-        bad_inventory = inventory_df[
-            ["inventory_on_hand", "safety_stock"]
-        ].isna().sum().sum()
-
-        if bad_inventory > 0:
+        if matched == 0:
             st.warning(
-                f"{bad_inventory} inventory value(s) could not be converted."
+                f"! {label} loaded, but no matching SKUs were found."
             )
 
-        duplicate_skus = inventory_df[
-            inventory_df["sku"].duplicated(keep=False)
-        ]["sku"].unique()
+    return df, upload_df
 
-        if len(duplicate_skus) > 0:
-            st.error(
-                "Inventory file contains duplicate SKU(s). Examples: "
-                + ", ".join(duplicate_skus[:5])
-            )
 
-        else:
-            df = df.merge(
-                inventory_df[
-                    ["sku", "inventory_on_hand", "safety_stock"]
-                ],
-                on="sku",
-                how="left",
-                suffixes=("", "_uploaded")
-            )
+# ==========================================================
+# FILE UPLOAD BUTTONS
+# ==========================================================
 
-            matched = 0
-
-            if "inventory_on_hand_uploaded" in df.columns:
-                matched = df["inventory_on_hand_uploaded"].notna().sum()
-
-            total = len(df)
-
-            for col in ["inventory_on_hand", "safety_stock"]:
-                uploaded_col = f"{col}_uploaded"
-
-                if uploaded_col in df.columns:
-                    df[col] = df[uploaded_col].combine_first(df[col])
-                    df = df.drop(columns=[uploaded_col])
-
-            if matched == 0:
-                if len(inventory_df) > 0:
-                    st.warning(
-                        "Inventory file uploaded, but no matching SKUs were found. "
-                        "Check SKU alignment."
-                    )
-                else:
-                    st.error(
-                        "Inventory file appears empty or unreadable."
-                    )
-
-            
-
-leadtime_df = None
-
-if leadtime_uploaded is not None:
-    leadtime_df = pd.read_csv(leadtime_uploaded, sep=None,engine="python")
-    leadtime_df = standardize_columns(leadtime_df)
-    leadtime_df.columns = (
-    leadtime_df.columns.astype(str)
-    .str.strip()
-    .str.lower()
-    .str.replace("_", " ", regex=False)
-    .str.replace("\ufeff", "", regex=False)
+uploaded = st.file_uploader(
+    "Core Planning Dataset (Required)",
+    type=["csv", "xlsx"]
 )
 
-    rename_map = {
-    "product code": "sku",
-    "productcode": "sku",
-    "product_code": "sku",
-    "material": "sku",
-    "item": "sku",
+history_uploaded = st.file_uploader(
+    "Forecast Accuracy History (Optional)",
+    type=["csv", "xlsx"]
+)
 
-    "lead time": "lead_time_days",
-    "lead time days": "lead_time_days",
-    "lead_time": "lead_time_days",
-    "lead_time_days": "lead_time_days",
-    "replenishment lead time": "lead_time_days",
-    "lt": "lead_time_days"
-}
+margin_uploaded = st.file_uploader(
+    "Margin / Profitability Data (Optional)",
+    type=["csv", "xlsx"]
+)
 
-    leadtime_df.rename(columns=rename_map, inplace=True)
+supplier_uploaded = st.file_uploader(
+    "Supplier Performance Data (Optional)",
+    type=["csv", "xlsx"]
+)
 
-if leadtime_df is not None:
-    required_cols = ["sku", "lead_time_days"]
+inventory_uploaded = st.file_uploader(
+    "Inventory Position Data (Optional)",
+    type=["csv", "xlsx"]
+)
 
-    if not all(col in leadtime_df.columns for col in required_cols):
-        st.error("Lead time file must contain columns: 'sku' and 'lead_time_days'")
+leadtime_uploaded = st.file_uploader(
+    "Replenishment Lead Time Data (Optional)",
+    type=["csv", "xlsx"]
+)
 
-    else:
+contract_uploaded = st.file_uploader(
+    "Commercial / Contract Constraints (Optional)",
+    type=["csv", "xlsx"]
+)
 
-        leadtime_df["lead_time_days"] = pd.to_numeric(
-        clean_number(leadtime_df["lead_time_days"]),
-        errors="coerce"
-        )
 
-        bad_leadtime = leadtime_df["lead_time_days"].isna().sum()
+# ==========================================================
+# CORE DATASET
+# ==========================================================
 
-        if bad_leadtime > 0:
-            st.warning(f"{bad_leadtime} lead time value(s) could not be converted.")
-        duplicate_skus = leadtime_df[
-            leadtime_df["sku"].duplicated(keep=False)
-        ]["sku"].unique()
+template_df = build_template()
 
-        if len(duplicate_skus) > 0:
+if uploaded is None:
+    st.info("No core file uploaded. Showing sample data.")
+    df = template_df.copy()
+
+else:
+    try:
+        df = read_file(uploaded)
+        df = clean_headers(df)
+
+        core_map = {
+            "product_code": "sku",
+            "productcode": "sku",
+            "material": "sku",
+            "item": "sku",
+            "sales": "actual",
+            "demand": "actual",
+            "qty": "volume",
+            "quantity": "volume",
+        }
+
+        df.rename(columns=core_map, inplace=True)
+
+        required_core = ["sku", "forecast", "actual", "volume"]
+        missing = [c for c in required_core if c not in df.columns]
+
+        if missing:
             st.error(
-                "Lead time file contains duplicate SKU(s). Examples: "
-                + ", ".join(duplicate_skus[:5])
+                "✗ Core Planning Dataset failed. Missing columns: "
+                + ", ".join(missing).upper()
             )
-            leadtime_df = None
+            df = template_df.copy()
 
         else:
-            df = df.merge(
-                leadtime_df[["sku", "lead_time_days"]],
-                on="sku",
-                how="left",
-                suffixes=("", "_uploaded")
+            df["sku"] = normalize_sku(df["sku"])
+
+            for col in ["forecast", "actual", "volume"]:
+                df[col] = pd.to_numeric(
+                    clean_number(df[col]),
+                    errors="coerce"
+                )
+
+            st.success("✓ Core Planning Dataset loaded")
+
+            # create default columns if missing
+            defaults = {
+                "margin": 1,
+                "inventory_on_hand": 0,
+                "safety_stock": 0,
+                "lead_time_days": 14,
+                "supplier_otif": 0.95
+            }
+
+            for col, val in defaults.items():
+                if col not in df.columns:
+                    df[col] = val
+
+    except Exception:
+        st.error("✕ Core Planning Dataset failed")
+        df = template_df.copy()
+
+
+# ==========================================================
+# OPTIONAL FILES
+# ==========================================================
+
+# Forecast History
+history_df = None
+if history_uploaded is not None:
+    try:
+        history_df = read_file(history_uploaded)
+        history_df = clean_headers(history_df)
+
+        history_df.rename(columns={
+            "product_code": "sku",
+            "material": "sku",
+            "sales": "actual"
+        }, inplace=True)
+
+        req = ["sku", "actual", "forecast"]
+        missing = [c for c in req if c not in history_df.columns]
+
+        if missing:
+            st.error(
+                "✗ Forecast Accuracy History failed. Missing columns: "
+                + ", ".join(missing).upper()
             )
+            history_df = None
+        else:
+            history_df["sku"] = normalize_sku(history_df["sku"])
+            st.success("✓ Forecast Accuracy History loaded")
 
-            matched = 0
-            if "lead_time_days_uploaded" in df.columns:
-                matched = df["lead_time_days_uploaded"].notna().sum()
+    except Exception:
+        st.error("✗ Forecast Accuracy History failed")
+        history_df = None
 
-            total = len(df)
 
-            if "lead_time_days_uploaded" in df.columns:
-                df["lead_time_days"] = df["lead_time_days_uploaded"].combine_first(df["lead_time_days"])
-                df = df.drop(columns=["lead_time_days_uploaded"])
+# Margin
+df, margin_df = upload_and_merge(
+    margin_uploaded,
+    "Margin / Profitability Data",
+    ["sku", "margin"],
+    {
+        "product_code": "sku",
+        "material": "sku",
+        "gross_margin": "margin",
+        "margin_%": "margin"
+    },
+    ["margin"],
+    ["sku", "margin"],
+    df
+)
 
-            if matched == 0:
-                if len(leadtime_df) > 0:
-                    st.warning("Lead time file uploaded, but no matching SKUs were found. Check SKU alignment.")
-                else:
-                    st.error("Lead time file appears empty or unreadable.")
+# Supplier
+df, supplier_df = upload_and_merge(
+    supplier_uploaded,
+    "Supplier Performance Data",
+    ["sku", "supplier_otif"],
+    {
+        "product_code": "sku",
+        "material": "sku",
+        "otif": "supplier_otif"
+    },
+    ["supplier_otif"],
+    ["sku", "supplier_otif"],
+    df
+)
 
-            
+# Inventory
+df, inventory_df = upload_and_merge(
+    inventory_uploaded,
+    "Inventory Position Data",
+    ["sku", "inventory_on_hand", "safety_stock"],
+    {
+        "product_code": "sku",
+        "material": "sku",
+        "stock": "inventory_on_hand",
+        "inventory": "inventory_on_hand",
+        "ss": "safety_stock"
+    },
+    ["inventory_on_hand", "safety_stock"],
+    ["sku", "inventory_on_hand", "safety_stock"],
+    df
+)
+
+# Lead Time
+df, leadtime_df = upload_and_merge(
+    leadtime_uploaded,
+    "Replenishment Lead Time Data",
+    ["sku", "lead_time_days"],
+    {
+        "product_code": "sku",
+        "material": "sku",
+        "lead_time": "lead_time_days",
+        "lt": "lead_time_days"
+    },
+    ["lead_time_days"],
+    ["sku", "lead_time_days"],
+    df
+)
+
+# Contract
+df, contract_df = upload_and_merge(
+    contract_uploaded,
+    "Commercial / Contract Constraints",
+    ["sku", "moq"],
+    {
+        "product_code": "sku",
+        "material": "sku"
+    },
+    ["moq"],
+    ["sku", "moq"],
+    df
+)
 
 history_df = None
 
 if "history_file" in st.session_state and st.session_state["history_file"] is not None:
     try:
-        history_df = pd.read_csv(
-            st.session_state["history_file"],
+        file = st.session_state["history_file"]
+
+        if file.name.lower().endswith(".xlsx"):
+            history_df = pd.read_excel(file)
+        else:
+            history_df = pd.read_csv(
+            file,
             sep=None,
             engine="python"
-        )
+            )
+            st.success("✓ Forecast vs actual data loaded")
     except Exception:
-        st.warning("File skipped: invalid format or missing required columns.")
+        st.error("✕ Forecast vs Actual history must contain: SKU, ACTUAL, FORECAST.")
         history_df = None
 
 thresholds = RiskThresholds(low_coverage_days=low_coverage_days, poor_otif=poor_otif)
-metrics_df = compute_metrics(df, demand_weight, supply_weight, inventory_weight)
-result_df = assign_action(metrics_df, thresholds)
+metrics_df = compute_metrics(
+    df,
+    demand_weight,
+    supply_weight,
+    inventory_weight,
+    demand_change_pct,
+    lead_time_change_days,
+    otif_change_pct,
+)
+result_df = assign_action(metrics_df, thresholds, contract_active, moq_waived,)
 
 max_top_n = max(1, min(50, len(result_df)))
 default_top_n = min(10, max_top_n)
@@ -1102,15 +1181,15 @@ if history_df is not None:
         "date": "date",
         "month": "date"
     })
-
+    
     if {"sku", "actual", "forecast"}.issubset(history_df.columns):
-
+        st.success("✓ Forecast vs actual data loaded")
         history_df["sku"] = normalize_sku(history_df["sku"])
         history_df["actual"] = pd.to_numeric(clean_number(history_df["actual"]), errors="coerce")
         history_df["forecast"] = pd.to_numeric(clean_number(history_df["forecast"]), errors="coerce")
 
         sku_history = history_df[history_df["sku"] == selected_sku].copy()
-
+        
         if not sku_history.empty:
             sku_history["ape"] = np.where(
                 sku_history["actual"] != 0,
@@ -1206,6 +1285,9 @@ elif action == "REDUCE INVENTORY" and selected["business_risk"] >= 10000:
 
 elif action == "REDUCE INVENTORY":
     st.info(f"📦 {clean_reasons}")
+
+elif action == "REVIEW CONTRACT":
+    st.warning(f"⚠️ Contract constraint active • {clean_reasons}")
 
 # Medium operational risk
 elif (
