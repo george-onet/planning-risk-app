@@ -749,16 +749,10 @@ with st.sidebar:
 # HEADER
 # =============================================================================
 
-
-st.markdown('<div class="main-title">PlanSignal</div>', unsafe_allow_html=True)
-
-st.markdown(
-    '<div class="subtitle">'
-    'Turns messy operational data into ranked priorities and recommended actions. '
-    'Forecast accuracy measured by WMAPE.'
-    '</div>',
-    unsafe_allow_html=True,
-)
+col1, col2, col3 = st.columns([1, 2, 3])
+with col1:
+    st.image("PlanSignal_light_.PNG", width=220)
+st.markdown("<p style='margin-top:-15px;font-style:italic;'>Where planning data becomes decisions.</p>", unsafe_allow_html=True)
 
 
 # =============================================================================
