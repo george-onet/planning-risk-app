@@ -41,6 +41,8 @@ ACTION_ICON = {
     "REDUCE INVENTORY": "🟡",
     "REVIEW CONTRACT":  "🔵",
     "MONITOR":          "🟢",
+    "REVIEW FORECAST": "🟣",
+
 }
 ACTION_COLOR = {
     "EXPEDITE":         "#C62828",
@@ -48,6 +50,7 @@ ACTION_COLOR = {
     "REDUCE INVENTORY": "#F9A825",
     "REVIEW CONTRACT":  "#1565C0",
     "MONITOR":          "#2E7D32",
+    "REVIEW FORECAST": "#6A1B9A",
 }
 
 ACTION_STATUS_OPTIONS = ["Open", "In Progress", "Resolved"]
@@ -416,9 +419,12 @@ def compute_metrics(
     else:
         work["leadtime_trend"] = "🟢 Stable"
 
-    # Excess stock value in EUR
     excess_units = np.maximum(work["inventory_on_hand"] - work["safety_stock"] * 2, 0)
     work["excess_stock_value"] = excess_units * work["margin"].clip(lower=0)
+
+    # Zero out excess stock when coverage is below lead time — not truly excess if stockout is incoming
+    work.loc[work["coverage_days"] < work["lead_time_days"], "excess_stock_value"] = 0
+
 
     # --- WMAPE from history (replaces MAPE) ---
     # At SKU level: sum(|actual - forecast|) / sum(actual) x 100
@@ -469,8 +475,13 @@ def compute_metrics(
 
     # --- FINANCIAL EXPOSURE (S&OP / finance-owned) ---
     units_short = np.maximum(work["safety_stock"] - work["inventory_on_hand"], 0)
+
+    stockout_days = np.maximum(work["lead_time_days"] - work["coverage_days"], 0)
+    shortfall_units = stockout_days * work["avg_daily_demand"].fillna(0)
+
     work["revenue_at_risk"] = (
-        units_short * work["margin"].abs().clip(lower=0.1)
+        np.maximum(units_short, shortfall_units)
+        * work["margin"].abs().clip(lower=0.1)
     ).fillna(0)
 
     # --- BUSINESS RISK (combined — keeps ranking working) ---
@@ -505,8 +516,8 @@ def assign_action(
         work["coverage_days"] <= 3,
 
         (work["inventory_on_hand"] < work["safety_stock"])
-        | (work["supplier_otif"] < thresholds.poor_otif)
-        | (work["lead_time_days"] > work["lead_time_days"].median()),
+        | ((work["supplier_otif"] < thresholds.poor_otif) & (work["coverage_days"] < work["lead_time_days"]))        | (work["lead_time_days"] > 60)
+        | (work["coverage_days"] < work["lead_time_days"]),
 
         (
             (contract_active)
@@ -514,12 +525,13 @@ def assign_action(
             & (work["call_off_volume"] > 0)
             & (work["coverage_days"] > 60)
         ),
+        (
+        ((work["coverage_days"] > 60) & (work["inventory_on_hand"] > work["safety_stock"] * 2))
+            | ((work["inventory_on_hand"] > work["safety_stock"] * 3) & (work["excess_stock_value"] > 50_000))
+        ),
 
-        (work["coverage_days"] > 60)
-        & (work["inventory_on_hand"] > work["safety_stock"] * 2),
-
-        (work["business_risk"] >= 10_000)
-        & (work["coverage_days"] > 45),
+        (work["wmape"] > 40)
+        & (work["coverage_days"] > 3),
     ]
 
     actions = [
@@ -527,7 +539,7 @@ def assign_action(
         "SUPPLY ISSUE",
         "REVIEW CONTRACT",
         "REDUCE INVENTORY",
-        "REDUCE INVENTORY",
+        "REVIEW FORECAST",
     ]
 
     work["recommended_action"] = np.select(conditions, actions, default="MONITOR")
@@ -555,6 +567,8 @@ def explain_sku_risk(row: pd.Series) -> List[str]:
     lead      = row["lead_time_days"]
     otif      = row["supplier_otif"]
     margin    = row["margin"]
+    wmape      = row.get("wmape", None)
+    excess_val = row.get("excess_stock_value", 0)
 
     if inventory < safety:
         drivers.append(("Inventory below safety stock", 1000))
@@ -572,6 +586,10 @@ def explain_sku_risk(row: pd.Series) -> List[str]:
         drivers.append(("Under-forecasting / stockout risk", abs(bias)))
     elif bias < 0 and inventory > safety * 1.5:
         drivers.append(("Over-forecasting / excess inventory risk", abs(bias)))
+    if wmape is not None and not pd.isna(wmape) and wmape > 40:
+        drivers.append(("Poor forecast accuracy — WMAPE above 40%", 750))
+    if inventory > safety * 2 and excess_val > 25_000:
+        drivers.append(("Excess inventory — working capital exposure", 650))
     if margin >= 10:
         drivers.append(("High margin exposure", 500))
 
@@ -1157,18 +1175,18 @@ st.markdown("---")
 # RISK EXPOSURE CHART
 # =============================================================================
 
-st.subheader("Risk Exposure")
-st.markdown(
-    '<div class="section-note">Top SKUs by business risk. Screenshot-ready for S&OP reviews.</div>',
-    unsafe_allow_html=True,
-)
-chart_df = (
-    result_df[["sku","business_risk"]]
-    .head(top_n)
-    .sort_values("business_risk", ascending=False)
-    .rename(columns={"sku":"SKU","business_risk":"Risk (EUR)"})
-)
-st.bar_chart(chart_df, x="SKU", y="Risk (EUR)", horizontal=True)
+with st.expander("Risk Exposure", expanded=False):
+    st.markdown(
+        '<div class="section-note">Top SKUs by business risk. Screenshot-ready for S&OP reviews.</div>',
+        unsafe_allow_html=True,
+    )
+    chart_df = (
+        result_df[["sku","business_risk"]]
+        .head(top_n)
+        .sort_values("business_risk", ascending=False)
+        .rename(columns={"sku":"SKU","business_risk":"Risk (EUR)"})
+    )
+    st.bar_chart(chart_df, x="SKU", y="Risk (EUR)", horizontal=True)
 
 st.markdown("---")
 
@@ -1256,15 +1274,15 @@ clean_reasons = " • ".join(reasons)
 st.markdown("#### Risk Drivers")
 if selected["coverage_days"] <= 3:
     st.error(f"EXPEDITE REQUIRED — {clean_reasons}")
-elif selected["inventory_on_hand"] < selected["safety_stock"] or selected["supplier_otif"] < 0.80:
-    st.error(f"{clean_reasons}")
+elif action == "REDUCE INVENTORY":
+    st.warning(f"{clean_reasons}")
 elif action == "REVIEW CONTRACT":
     st.warning(f"Contract constraint active — {clean_reasons}")
-elif action == "REDUCE INVENTORY" and selected["business_risk"] >= 10_000:
-    st.warning(f"{clean_reasons}")
-elif action == "REDUCE INVENTORY":
-    st.info(f"{clean_reasons}")
+elif selected["inventory_on_hand"] < selected["safety_stock"] or selected["supplier_otif"] < 0.80:
+    st.error(f"{clean_reasons}")
 elif selected["coverage_days"] <= 14 or selected["supplier_otif"] < 0.90 or selected["lead_time_days"] > 30:
+    st.warning(f"{clean_reasons}")
+elif action == "REVIEW FORECAST":
     st.warning(f"{clean_reasons}")
 else:
     st.success(f"{clean_reasons}")
