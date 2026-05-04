@@ -38,7 +38,7 @@ OPTIONAL_HISTORY_COLUMNS = ["hist_1", "hist_2", "hist_3"]
 ACTION_ICON = {
     "EXPEDITE":         "🔴",
     "SUPPLY ISSUE":     "🟠",
-    "REDUCE INVENTORY": "🟡",
+    "OPTIMISE INVENTORY": "🟡",
     "REVIEW CONTRACT":  "🔵",
     "MONITOR":          "🟢",
     "REVIEW FORECAST": "🟣",
@@ -47,7 +47,7 @@ ACTION_ICON = {
 ACTION_COLOR = {
     "EXPEDITE":         "#C62828",
     "SUPPLY ISSUE":     "#EF6C00",
-    "REDUCE INVENTORY": "#F9A825",
+    "OPTIMISE INVENTORY": "#F9A825",
     "REVIEW CONTRACT":  "#1565C0",
     "MONITOR":          "#2E7D32",
     "REVIEW FORECAST": "#6A1B9A",
@@ -538,7 +538,7 @@ def assign_action(
         "EXPEDITE",
         "SUPPLY ISSUE",
         "REVIEW CONTRACT",
-        "REDUCE INVENTORY",
+        "OPTIMISE INVENTORY",
         "REVIEW FORECAST",
     ]
 
@@ -589,7 +589,10 @@ def explain_sku_risk(row: pd.Series) -> List[str]:
     if wmape is not None and not pd.isna(wmape) and wmape > 40:
         drivers.append(("Poor forecast accuracy — WMAPE above 40%", 750))
     if inventory > safety * 2 and excess_val > 25_000:
-        drivers.append(("Excess inventory — working capital exposure", 650))
+        if otif < 0.70:
+            drivers.append(("Reduce inventory cautiously — supplier reliability is low", 660))
+        else:
+            drivers.append(("Excess inventory — working capital exposure", 650))
     if margin >= 10:
         drivers.append(("High margin exposure", 500))
 
@@ -753,22 +756,24 @@ col1, col2, col3 = st.columns([1, 2, 3])
 with col1:
     st.image("PlanSignal_light_.PNG", width=220)
 st.markdown("<p style='margin-top:-15px;font-style:italic;'>Where planning data becomes decisions.</p>", unsafe_allow_html=True)
+st.caption("Use the sidebar ← to adjust risk weights, run scenarios and set thresholds.")
 
 
 # =============================================================================
 # FILE UPLOADERS
 # =============================================================================
 
-col_up1, col_up2 = st.columns(2)
-with col_up1:
-    uploaded           = st.file_uploader("SKU planning data (required)",          type=["csv","xlsx"], key="main_upload_v2")
-    history_uploaded   = st.file_uploader("Forecast vs actual history (optional)",  type=["csv","xlsx"], key="history_upload")
-    margin_uploaded    = st.file_uploader("Margin data (optional)",                 type=["csv","xlsx"], key="margin_upload")
-with col_up2:
-    supplier_uploaded  = st.file_uploader("Supplier data (optional)",               type=["csv","xlsx"], key="supplier_upload")
-    inventory_uploaded = st.file_uploader("Inventory data (optional)",              type=["csv","xlsx"], key="inventory_upload")
-    leadtime_uploaded  = st.file_uploader("Lead time data (optional)",              type=["csv","xlsx"], key="leadtime_upload")
-    contract_uploaded  = st.file_uploader("Contract data (optional)",               type=["csv","xlsx"], key="contract_upload")
+with st.expander("📂 Upload data files", expanded=True):
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        uploaded           = st.file_uploader("SKU planning data (required)",          type=["csv","xlsx"], key="main_upload_v2")
+        history_uploaded   = st.file_uploader("Forecast vs actual history (optional)",  type=["csv","xlsx"], key="history_upload")
+        margin_uploaded    = st.file_uploader("Margin data (optional)",                 type=["csv","xlsx"], key="margin_upload")
+    with col_up2:
+        supplier_uploaded  = st.file_uploader("Supplier data (optional)",               type=["csv","xlsx"], key="supplier_upload")
+        inventory_uploaded = st.file_uploader("Inventory data (optional)",              type=["csv","xlsx"], key="inventory_upload")
+        leadtime_uploaded  = st.file_uploader("Lead time data (optional)",              type=["csv","xlsx"], key="leadtime_upload")
+        contract_uploaded  = st.file_uploader("Contract data (optional)")      
 
 template_df  = build_template()
 template_csv = template_df.to_csv(index=False).encode("utf-8")
@@ -1060,7 +1065,7 @@ st.markdown("---")
 # =============================================================================
 
 max_top_n     = max(1, min(200, len(result_df)))
-default_top_n = min(20, max_top_n)
+default_top_n = min(50, max_top_n)
 top_n = (
     st.slider("SKUs to display", min(5, max_top_n), max_top_n, default_top_n)
     if max_top_n > 5 else max_top_n
@@ -1079,12 +1084,12 @@ display_source = {
     "sku":               "SKU",
     "recommended_action":"Action",
     "action_status":     "Status",
-    "business_risk":     "Risk (EUR)",
+    "risk_drivers":      "Risk Drivers",
+    "business_risk":     "Business Risk Index",
     "revenue_at_risk":   "Revenue at Risk (€)",
     "demand_trend":      "Trend",
     "wmape":             "WMAPE (%)",
     "excess_stock_value":"Excess Stock (EUR)",
-    "risk_drivers":      "Risk Drivers",
     "coverage_days":     "Coverage (days)",
     "lead_time_days":    "Lead Time (days)",
     "supplier_otif":     "OTIF (%)",
@@ -1095,7 +1100,7 @@ display_source = {
 table_df = result_df.head(top_n)[[c for c in display_source if c in result_df.columns]].copy()
 table_df.rename(columns=display_source, inplace=True)
 table_df["Action"]             = table_df["Action"].map(format_action)
-table_df["Risk (EUR)"]         = table_df["Risk (EUR)"].round(0)
+table_df["Business Risk Index"] = table_df["Business Risk Index"].round(0)
 table_df["Excess Stock (EUR)"] = table_df["Excess Stock (EUR)"].round(0)
 table_df["Coverage (days)"]    = table_df["Coverage (days)"].round(1)
 table_df["Lead Time (days)"]   = table_df["Lead Time (days)"].round(0)
@@ -1247,7 +1252,8 @@ if history_df is not None:
 
 # KPI rows
 k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("Risk (EUR)",        f"EUR {selected['business_risk']:,.0f}")
+k1.metric("Business Risk Index", f"EUR {selected['business_risk']:,.0f}",
+          help="Composite risk score weighted by unit margin and volume. Ranks priority — not a precise financial forecast.")
 k2.metric("Action",            selected["recommended_action"])
 k3.metric("Status",            st.session_state["action_status"].get(selected_sku, "Open"))
 k4.metric("Coverage (days)",   f"{selected['coverage_days']:.1f}")
@@ -1256,7 +1262,8 @@ k6.metric("WMAPE",             f"{sku_wmape:.1f}%" if sku_wmape is not None else
           help="Volume-weighted forecast error for this SKU across all history periods.")
 
 k7, k8, k9 = st.columns(3)
-k7.metric("Revenue at Risk",    f"EUR {selected['revenue_at_risk']:,.0f}")
+k7.metric("Revenue at Risk",    f"EUR {selected['revenue_at_risk']:,.0f}",
+          help="Estimated margin exposure from shortage risk before replenishment arrives. Based on projected shortfall units × unit margin.")
 k8.metric("Excess Stock (EUR)", f"EUR {selected['excess_stock_value']:,.0f}")
 k9.metric("Demand Trend",      selected.get("demand_trend", "→"))
 
@@ -1268,7 +1275,7 @@ clean_reasons = " • ".join(reasons)
 st.markdown("#### Risk Drivers")
 if selected["coverage_days"] <= 3:
     st.error(f"EXPEDITE REQUIRED — {clean_reasons}")
-elif action == "REDUCE INVENTORY":
+elif action == "OPTIMISE INVENTORY":
     st.warning(f"{clean_reasons}")
 elif action == "REVIEW CONTRACT":
     st.warning(f"Contract constraint active — {clean_reasons}")
@@ -1314,7 +1321,7 @@ if sku_history is not None and not sku_history.empty and "date" in sku_history.c
         .sort_values("date")
     )
     if not sku_history.empty:
-        st.markdown("#### Forecast vs Actual")
+        st.markdown(f"#### Forecast vs Actual — {selected_sku}")
         st.line_chart(sku_history.set_index("date")[["forecast","actual","error"]])
 else:
     st.info(
@@ -1348,9 +1355,9 @@ Excess above 2x safety stock weighted at 25% (working capital concern).
 | Action | Trigger |
 |---|---|
 | EXPEDITE | Coverage <= 3 days |
-| SUPPLY ISSUE | Below safety stock or OTIF < threshold or long lead time |
+| SUPPLY ISSUE | Replenishment at risk — stock, supplier, or lead time cannot guarantee continuity |
 | REVIEW CONTRACT | Contract active + outstanding call-off + excess cover |
-| REDUCE INVENTORY | Coverage > 60 days + stock > 2x safety stock |
+| OPTIMISE INVENTORY | Coverage > 60 days + stock > 2x safety stock |
 | MONITOR | No urgent trigger detected |
 
 **Demand trend** — 3-period linear slope from hist_1/hist_2/hist_3.
