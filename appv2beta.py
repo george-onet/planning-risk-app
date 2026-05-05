@@ -20,13 +20,14 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
-
+import sqlite3
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
 
 LOG_FILE = "usage_log.csv"
+STATUS_DB = "plansignal_status.db"
 
 REQUIRED_COLUMNS = [
     "sku", "forecast", "actual", "volume",
@@ -35,22 +36,25 @@ REQUIRED_COLUMNS = [
 ]
 OPTIONAL_HISTORY_COLUMNS = ["hist_1", "hist_2", "hist_3"]
 
-ACTION_ICON = {
-    "EXPEDITE":         "🔴",
-    "SUPPLY ISSUE":     "🟠",
-    "OPTIMISE INVENTORY": "🟡",
-    "REVIEW CONTRACT":  "🔵",
-    "MONITOR":          "🟢",
-    "REVIEW FORECAST": "🟣",
-
+ACTION_URGENCY = {
+    "EXPEDITE":           "RED",
+    "SUPPLY ISSUE":       "RED",
+    "OPTIMISE INVENTORY": "YELLOW",
+    "REVIEW CONTRACT":    "YELLOW",
+    "REVIEW FORECAST":    "YELLOW",
+    "MONITOR":            "GREEN",
 }
-ACTION_COLOR = {
-    "EXPEDITE":         "#C62828",
-    "SUPPLY ISSUE":     "#EF6C00",
-    "OPTIMISE INVENTORY": "#F9A825",
-    "REVIEW CONTRACT":  "#1565C0",
-    "MONITOR":          "#2E7D32",
-    "REVIEW FORECAST": "#6A1B9A",
+
+URGENCY_COLOR = {
+    "RED":    "#C62828",
+    "YELLOW": "#F9A825",
+    "GREEN":  "#2E7D32",
+}
+
+URGENCY_ICON = {
+    "RED":    "🔴",
+    "YELLOW": "🟡",
+    "GREEN":  "🟢",
 }
 
 ACTION_STATUS_OPTIONS = ["Open", "In Progress", "Resolved"]
@@ -107,8 +111,10 @@ def min_max_scale(series: pd.Series) -> pd.Series:
     return (s - lo) / (hi - lo)
 
 
-def format_action(action: str) -> str:
-    return f"{ACTION_ICON.get(action, '⚪')} {action}"
+def format_action_label(action: str) -> str:
+    urgency = ACTION_URGENCY.get(action, "GREEN")
+    icon = URGENCY_ICON.get(urgency, "⚪")
+    return f"{icon} {action}"
 
 
 def log_event(event_name: str) -> None:
@@ -152,7 +158,66 @@ RENAME_MAIN = {
     "margin": "margin", "gross_margin": "margin",
     "margin_pct": "margin", "margin_%": "margin",
 }
+# =============================================================================
+# ACTION STATUS PERSISTENCE
+# Soft persistence via local SQLite. Survives normal use; may reset on
+# Streamlit Cloud cold starts or redeploys. Documented limitation in v1.
+# =============================================================================
 
+def _db_init() -> None:
+    """Create the status table if it doesn't exist."""
+    with sqlite3.connect(STATUS_DB) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS action_status (
+                sku TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            )
+        """)
+
+
+def db_load_statuses() -> dict:
+    """Read all (sku, status) pairs from DB into a dict."""
+    _db_init()
+    with sqlite3.connect(STATUS_DB) as conn:
+        rows = conn.execute("SELECT sku, status FROM action_status").fetchall()
+    return {sku: status for sku, status in rows}
+
+
+def db_save_status(sku: str, status: str) -> None:
+    """Upsert one SKU's status."""
+    _db_init()
+    with sqlite3.connect(STATUS_DB) as conn:
+        conn.execute("""
+            INSERT INTO action_status (sku, status, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(sku) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at
+        """, (sku, status, datetime.now()))
+
+
+def db_clear_all_statuses() -> int:
+    """Delete every row. Returns number deleted."""
+    _db_init()
+    with sqlite3.connect(STATUS_DB) as conn:
+        cur = conn.execute("DELETE FROM action_status")
+        return cur.rowcount
+
+
+def db_get_status_updated(sku: str) -> Optional[datetime]:
+    """Get last update timestamp for one SKU. Returns None if not yet saved."""
+    _db_init()
+    with sqlite3.connect(STATUS_DB) as conn:
+        row = conn.execute(
+            "SELECT updated_at FROM action_status WHERE sku = ?", (sku,)
+        ).fetchone()
+    if row:
+        try:
+            return datetime.fromisoformat(row[0])
+        except (ValueError, TypeError):
+            return None
+    return None
 
 # =============================================================================
 # GENERIC OPTIONAL FILE LOADER
@@ -516,8 +581,9 @@ def assign_action(
         work["coverage_days"] <= 3,
 
         (work["inventory_on_hand"] < work["safety_stock"])
-        | ((work["supplier_otif"] < thresholds.poor_otif) & (work["coverage_days"] < work["lead_time_days"]))        | (work["lead_time_days"] > 60)
-        | (work["coverage_days"] < work["lead_time_days"]),
+            | ((work["supplier_otif"] < thresholds.poor_otif) & (work["coverage_days"] < work["lead_time_days"]))
+            | ((work["supplier_otif"] < 0.65) & (work["coverage_days"] < 60))
+            | (work["coverage_days"] < work["lead_time_days"] * 0.7),
 
         (
             (contract_active)
@@ -607,7 +673,8 @@ def explain_sku_risk(row: pd.Series) -> List[str]:
 # =============================================================================
 
 def style_actions(val: str) -> str:
-    bg = ACTION_COLOR.get(val, "#9E9E9E")
+    urgency = ACTION_URGENCY.get(val, "GREEN")
+    bg = URGENCY_COLOR.get(urgency, "#9E9E9E")
     return f"background-color: {bg}20; color: {bg}; font-weight: 700;"
 
 
@@ -709,8 +776,10 @@ if "visited" not in st.session_state:
     st.session_state["visited"] = True
 
 if "action_status" not in st.session_state:
-    st.session_state["action_status"] = {}
+    st.session_state["action_status"] = db_load_statuses()
 
+if "editor_key" not in st.session_state:
+    st.session_state["editor_key"] = 0
 
 # =============================================================================
 # SIDEBAR
@@ -747,6 +816,14 @@ with st.sidebar:
     low_coverage_days = st.number_input("Low coverage (days)", min_value=1.0, value=14.0)
     poor_otif         = st.number_input("Poor OTIF threshold", 0.0, 1.0, 0.85, 0.01)
 
+    st.markdown("---")
+    st.header("Action Status")
+    st.caption(f"{len(st.session_state.get('action_status', {}))} SKUs have saved statuses")
+    if st.button("🗑 Clear all statuses", use_container_width=True):
+        n = db_clear_all_statuses()
+        st.session_state["action_status"] = {}
+        st.session_state["editor_key"] += 1
+        st.success(f"Cleared {n} saved statuses")
 
 # =============================================================================
 # HEADER
@@ -774,6 +851,37 @@ with st.expander("📂 Upload data files", expanded=True):
         inventory_uploaded = st.file_uploader("Inventory data (optional)",              type=["csv","xlsx"], key="inventory_upload")
         leadtime_uploaded  = st.file_uploader("Lead time data (optional)",              type=["csv","xlsx"], key="leadtime_upload")
         contract_uploaded  = st.file_uploader("Contract data (optional)")      
+
+with st.expander("ℹ️ How PlanSignal works", expanded=False):
+    st.markdown("""
+**What it does**
+
+PlanSignal turns raw planning data into a ranked list of SKUs that need attention. Upload your demand, supply, inventory and forecast files — the app surfaces the SKUs at highest risk of stockouts, excess capital, or forecast misses, and tells you what action to take on each.
+
+Built for supply chain planners who spend their Mondays manually combining files in Excel.
+
+---
+
+**How to read the actions**
+
+Every SKU gets one of six action labels, colour-coded by urgency:
+
+- 🔴 **Act now** — EXPEDITE, SUPPLY ISSUE → service or stockout risk
+- 🟡 **Review or rebalance** — REVIEW CONTRACT, OPTIMISE INVENTORY, REVIEW FORECAST → inefficiency or conflicting signals
+- 🟢 **Stable** — MONITOR → no action needed today
+
+The label is derived from hard rules on coverage, supplier OTIF, inventory levels, and forecast accuracy. Tunable in the sidebar.
+
+---
+
+**How ranking works**
+
+SKUs are ranked by **Business Risk Index** — a composite risk score multiplied by unit margin and volume. The biggest financial exposures rise to the top.
+
+The risk score itself blends three components: **demand risk** (forecast error, volatility), **supply risk** (supplier OTIF × lead time), and **inventory risk** (shortage and excess). The mix is controlled by the *Risk Weights* sliders in the sidebar — defaults are 50% demand, 30% supply, 20% inventory.
+
+*Action labels are independent of the weights. The weights affect which SKUs surface first, not what to do about them.*
+    """)
 
 template_df  = build_template()
 template_csv = template_df.to_csv(index=False).encode("utf-8")
@@ -944,13 +1052,31 @@ if leadtime_uploaded:
 if contract_uploaded:
     contract_df = _load_optional(
         contract_uploaded,
-        {"sku":"sku","moq":"moq","contract_volume":"contract_volume","penalty_eur":"penalty_eur"},
+        {
+            "sku":"sku","product_code":"sku","productcode":"sku",
+            "product":"sku","material":"sku","material_number":"sku",
+            "material_no":"sku","item":"sku",
+            "moq":"moq","min_order_qty":"moq","minimum_order_quantity":"moq",
+            "call_off":"call_off_volume","call_off_volume":"call_off_volume",
+            "calloff":"call_off_volume","monthly_call_off":"call_off_volume",
+            "monthly_call_off_vol":"call_off_volume",
+            "contract_volume":"contract_volume","contract_vol":"contract_volume",
+            "annual_volume":"contract_volume","annual_contract_vol":"contract_volume",
+            "penalty_eur":"penalty_eur","penalty":"penalty_eur",
+            "penalty_€":"penalty_eur","non_fulfilment_penalty":"penalty_eur",
+        },
         ["sku","moq"], "Contract data",
     )
     if contract_df is not None:
-        for c in ["moq","contract_volume","penalty_eur"]:
+        for c in ["moq","call_off_volume","contract_volume","penalty_eur"]:
             if c in contract_df.columns:
-                contract_df[c] = pd.to_numeric(contract_df[c], errors="coerce").fillna(0)
+                contract_df[c] = pd.to_numeric(
+                    clean_number(contract_df[c]), errors="coerce"
+                ).fillna(0)
+        dups = contract_df[contract_df["sku"].duplicated(keep=False)]["sku"].unique()
+        if len(dups):
+            st.warning(f"Duplicate SKUs in contract file: {', '.join(dups[:5])} — keeping first occurrence")
+            contract_df = contract_df.drop_duplicates(subset=["sku"], keep="first")
         df = df.merge(contract_df, on="sku", how="left")
 
 history_df = None
@@ -1074,8 +1200,9 @@ top_n = (
 st.subheader("Priority SKUs")
 st.markdown(
     '<div class="section-note">'
-    'Ranked by business risk. WMAPE shown per SKU — higher = less accurate forecast. '
-    'Update Status inline.'
+    '<b>Ranked by Business Risk Index</b> — composite risk × unit margin × volume. '
+    'Risk weighting (Demand · Supply · Inventory) tunable in the sidebar. '
+    'WMAPE shown per SKU — higher = less accurate forecast. Update Status inline.'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -1099,7 +1226,7 @@ display_source = {
 
 table_df = result_df.head(top_n)[[c for c in display_source if c in result_df.columns]].copy()
 table_df.rename(columns=display_source, inplace=True)
-table_df["Action"]             = table_df["Action"].map(format_action)
+table_df["Action"]             = table_df["Action"].map(format_action_label)
 table_df["Business Risk Index"] = table_df["Business Risk Index"].round(0)
 table_df["Excess Stock (EUR)"] = table_df["Excess Stock (EUR)"].round(0)
 table_df["Coverage (days)"]    = table_df["Coverage (days)"].round(1)
@@ -1147,7 +1274,11 @@ edited = st.data_editor(
 )
 
 for _, row in edited.iterrows():
-    st.session_state["action_status"][row["SKU"]] = row["Status"]
+    sku, status = row["SKU"], row["Status"]
+    # only write if status actually changed (avoids unnecessary DB writes)
+    if st.session_state["action_status"].get(sku, "Open") != status:
+        st.session_state["action_status"][sku] = status
+        db_save_status(sku, status)
 
 
 # =============================================================================
@@ -1255,7 +1386,10 @@ k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Business Risk Index", f"EUR {selected['business_risk']:,.0f}",
           help="Composite risk score weighted by unit margin and volume. Ranks priority — not a precise financial forecast.")
 k2.metric("Action",            selected["recommended_action"])
-k3.metric("Status",            st.session_state["action_status"].get(selected_sku, "Open"))
+status_val = st.session_state["action_status"].get(selected_sku, "Open")
+updated = db_get_status_updated(selected_sku)
+status_caption = f"changed {updated.strftime('%a %H:%M')}" if updated else "default"
+k3.metric("Status", status_val, help=status_caption)
 k4.metric("Coverage (days)",   f"{selected['coverage_days']:.1f}")
 k5.metric("Supplier OTIF",     f"{selected['supplier_otif'] * 100:.1f}%")
 k6.metric("WMAPE",             f"{sku_wmape:.1f}%" if sku_wmape is not None else "N/A",
@@ -1273,20 +1407,22 @@ action        = selected.get("recommended_action","").upper()
 clean_reasons = " • ".join(reasons)
 
 st.markdown("#### Risk Drivers")
-if selected["coverage_days"] <= 3:
-    st.error(f"EXPEDITE REQUIRED — {clean_reasons}")
-elif action == "OPTIMISE INVENTORY":
-    st.warning(f"{clean_reasons}")
+
+urgency = ACTION_URGENCY.get(action, "GREEN")
+
+if action == "EXPEDITE":
+    banner_text = f"EXPEDITE REQUIRED — {clean_reasons}"
 elif action == "REVIEW CONTRACT":
-    st.warning(f"Contract constraint active — {clean_reasons}")
-elif selected["inventory_on_hand"] < selected["safety_stock"] or selected["supplier_otif"] < 0.80:
-    st.error(f"{clean_reasons}")
-elif selected["coverage_days"] <= 14 or selected["supplier_otif"] < 0.90 or selected["lead_time_days"] > 30:
-    st.warning(f"{clean_reasons}")
-elif action == "REVIEW FORECAST":
-    st.warning(f"{clean_reasons}")
+    banner_text = f"Contract constraint active — {clean_reasons}"
 else:
-    st.success(f"{clean_reasons}")
+    banner_text = clean_reasons
+
+if urgency == "RED":
+    st.error(banner_text)
+elif urgency == "YELLOW":
+    st.warning(banner_text)
+else:
+    st.success(banner_text)
 
 # Metric breakdown
 explain_data = {
