@@ -1,1 +1,5 @@
 .DS_Store
+*.db
+plansignal_status.db
+usage_log.csv
+__pycache__/
